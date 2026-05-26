@@ -14,42 +14,84 @@ for candidate in [
 
 import cv2
 import numpy as np
+from typing import Dict, Union
 
 def create_warped_ad_and_mask(ad_img, frame_shape, dst_pts):
-    if ad_img.ndim == 2:
-        ad_img = cv2.cvtColor(ad_img, cv2.COLOR_GRAY2BGR)
-
+    """Warp the ad image and generate a precise alpha mask based on image channels."""
+    fh, fw = frame_shape[:2]
+    ah, aw = ad_img.shape[:2]
+    
+    # Coordinates of the source ad image corners
+    src_pts = np.array([[0, 0], [aw - 1, 0], [aw - 1, ah - 1], [0, ah - 1]], dtype=np.float32)
+    dst_pts = np.array(dst_pts, dtype=np.float32)
+    
+    # Calculate Homography Matrix
+    H, _ = cv2.findHomography(src_pts, dst_pts)
+    
+    # Separate color and alpha channel if image is RGBA
     if ad_img.shape[2] == 4:
+        bgr = ad_img[:, :, :3]
         alpha = ad_img[:, :, 3]
-        src_ad = ad_img[:, :, :3]
-        mask_src = cv2.threshold(alpha, 1, 255, cv2.THRESH_BINARY)[1]
     else:
-        src_ad = ad_img
-        gray_ad = cv2.cvtColor(src_ad, cv2.COLOR_BGR2GRAY)
-        mask_src = cv2.threshold(gray_ad, 1, 255, cv2.THRESH_BINARY)[1]
+        bgr = ad_img
+        alpha = np.ones((ah, aw), dtype=np.uint8) * 255
 
-    src_h, src_w = src_ad.shape[:2]
-    src_pts = np.array([[0, 0], [src_w, 0], [src_w, src_h], [0, src_h]], dtype=np.float32)
-    M = cv2.getPerspectiveTransform(src_pts, dst_pts.astype(np.float32))
-
-    warped_ad = cv2.warpPerspective(src_ad, M, (frame_shape[1], frame_shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_TRANSPARENT)
-    warped_mask = cv2.warpPerspective(mask_src, M, (frame_shape[1], frame_shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    warped_mask = cv2.GaussianBlur(warped_mask, (21, 21), 10)
-
+    # Warp both the BGR image and the Alpha mask accurately
+    warped_ad = cv2.warpPerspective(bgr, H, (fw, fh))
+    warped_mask = cv2.warpPerspective(alpha, H, (fw, fh))
+    
     return warped_ad, warped_mask
 
 
-def blend_ad_into_roi(frame, ad_img, dst_pts):
+def blend_ad_into_roi(frame, ad_img, dst_pts, mode='feather', feather_radius=5):
+    """Blend `ad_img` into `frame` at polygon `dst_pts` matching pixel specifications.
+
+    mode: one of 'seamless', 'feather', 'seamless_feather'
+    - 'feather' (RECOMMENDED FOR LOGOS): Pure alpha blending with a soft boundary transition.
+    - 'seamless': Matches background illumination (use only for solid, non-branding textures).
+    - 'seamless_feather': Color matches the interior via seamlessClone and softens the outer perimeter.
+    """
+    # 1. Warp the image and isolate its true alpha mask
     warped_ad, warped_mask = create_warped_ad_and_mask(ad_img, frame.shape, dst_pts)
     if np.count_nonzero(warped_mask) == 0:
         return frame
 
+    # 2. Setup baseline canvas layers
+    blended_base = frame.copy()
+    
+    # Create clean binary mask required by seamlessClone operations
+    mask_for_clone = cv2.threshold(warped_mask, 1, 255, cv2.THRESH_BINARY)[1].astype(np.uint8)
     center = tuple(np.mean(dst_pts, axis=0).astype(int))
-    try:
-        blended = cv2.seamlessClone(warped_ad, frame, warped_mask, center, cv2.NORMAL_CLONE)
-    except cv2.error:
-        blended = frame
-    return blended
+
+    # --- SEAMLESS CLONING STAGE ---
+    if mode in ('seamless', 'seamless_feather'):
+        try:
+            # Use MIXED_CLONE so background textures can show through transparent areas if needed
+            blended_base = cv2.seamlessClone(warped_ad, frame, mask_for_clone, center, cv2.MIXED_CLONE)
+        except cv2.error:
+            blended_base = frame.copy()
+
+    # --- FEATHER (ALPHA BLENDING) STAGE ---
+    if mode in ('feather', 'seamless_feather'):
+        # Ensure feather radius configuration is an odd integer
+        if feather_radius % 2 == 0:
+            feather_radius += 1
+            
+        # Create a smooth alpha gradient map at the boundaries
+        soft_mask = cv2.GaussianBlur(warped_mask, (feather_radius, feather_radius), 0)
+        alpha = soft_mask.astype(np.float32) / 255.0
+        alpha_3c = cv2.merge([alpha, alpha, alpha])
+
+        # Source layer is determined by whether seamless execution occurred first
+        src_f = warped_ad.astype(np.float32) if mode == 'feather' else blended_base.astype(np.float32)
+        dst_f = frame.astype(np.float32)
+
+        # Mathematical Linear Interpolation Blend Formula
+        composite = (alpha_3c * src_f) + ((1.0 - alpha_3c) * dst_f)
+        final = np.clip(composite, 0, 255).astype(np.uint8)
+        return final
+
+    return blended_base
 
 def run_pure_opencv_tracker(video_path):
     # 1. Initialize SIFT detector
@@ -57,8 +99,10 @@ def run_pure_opencv_tracker(video_path):
     
     # Configure FLANN matcher for speed
     FLANN_INDEX_KDTREE = 1
-    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-    search_params = dict(checks=50)
+    # Use explicit value union to satisfy strict type checkers
+    IndexParamType = Dict[str, Union[bool, int, float, str]]
+    index_params: IndexParamType = {"algorithm": FLANN_INDEX_KDTREE, "trees": 5}
+    search_params: IndexParamType = {"checks": 50}
     flann = cv2.FlannBasedMatcher(index_params, search_params)
 
     # 2. Load the ad image and open the video stream
@@ -141,18 +185,38 @@ def run_pure_opencv_tracker(video_path):
                     good_matches.append(m)
 
             if len(good_matches) >= 4:
-                # Extract coordinates of matched pairs
-                src_pts = np.float32([kp0[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                dst_pts = np.float32([kp1[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                # Validate matches and guard against out-of-range indices
+                valid_matches = []
+                for m in good_matches:
+                    # ensure the match object has expected attributes and indices are valid
+                    if not hasattr(m, 'queryIdx') or not hasattr(m, 'trainIdx'):
+                        continue
+                    if m.queryIdx < 0 or m.trainIdx < 0:
+                        continue
+                    if m.queryIdx >= len(kp0) or m.trainIdx >= len(kp1):
+                        continue
+                    valid_matches.append(m)
 
-                # Compute Homography using RANSAC
-                Hg, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                if len(valid_matches) >= 4:
+                    # Extract coordinates of matched pairs
+                    src_pts = np.array([kp0[m.queryIdx].pt for m in valid_matches], dtype=np.float32).reshape(-1, 1, 2)
+                    dst_pts = np.array([kp1[m.trainIdx].pt for m in valid_matches], dtype=np.float32).reshape(-1, 1, 2)
 
-                if Hg is not None:
-                    # Warp the 4 ROI points into the new frame space
-                    ad_roi_i = cv2.perspectiveTransform(ad_roi_0.reshape(-1, 1, 2), Hg).reshape(-1, 2)
-                    ad_roi_prev = ad_roi_i
+                    # Compute Homography using RANSAC
+                    try:
+                        Hg, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                    except cv2.error:
+                        Hg = None
+                        mask = None
+
+                    if Hg is not None:
+                        # Warp the 4 ROI points into the new frame space
+                        ad_roi_i = cv2.perspectiveTransform(ad_roi_0.reshape(-1, 1, 2), Hg).reshape(-1, 2)
+                        ad_roi_prev = ad_roi_i
+                    else:
+                        ad_roi_i = ad_roi_prev
                 else:
+                    # Not enough valid matches after filtering
                     ad_roi_i = ad_roi_prev
             else:
                 ad_roi_i = ad_roi_prev
@@ -161,7 +225,7 @@ def run_pure_opencv_tracker(video_path):
 
         # 6. Render the ad into the tracked ROI and draw the ROI polygon
         render_pts = np.round(ad_roi_i).astype(np.int32)
-        img1 = blend_ad_into_roi(img1, ad_img, ad_roi_i)
+        img1 = blend_ad_into_roi(img1, ad_img, ad_roi_i, mode='seamless')
         cv2.polylines(img1, [render_pts], isClosed=True, color=(0, 0, 255), thickness=3)
 
         tracked_roi_coords = ad_roi_i.reshape(-1, 2).tolist()

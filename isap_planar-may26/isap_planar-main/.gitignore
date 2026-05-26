@@ -1,0 +1,17 @@
+assets/checkpoints/*
+debug/*
+models/third_party/*
+test_data/*
+**/__pycache__/*
+**/.ipynb_checkpoints/*
+yolo26n-seg.pt
+yolov8l-seg.pt
+staging_dir/*
+staging_dir*/
+outputs/*
+knr/*
+knr.tar
+opencv_gpu_docker
+tracker_romav2_copy.py
+tracker_romav2_faster.py
+__pycache__
