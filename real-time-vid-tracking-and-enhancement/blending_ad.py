@@ -174,13 +174,54 @@ class PlanarARTracker:
         return True
 
     def validate_polygon(self, pts: np.ndarray) -> bool:
-        """Verifies if the tracked polygon shape remains convex and mathematically realistic."""
+        """Validates structural integrity by comparing edge proportions directly to Frame 0."""
         render_pts = np.round(pts).astype(np.int32)
+        
+        # 1. Basic Convexity Guard
         if not cv2.isContourConvex(render_pts):
             return False
-        area = cv2.contourArea(render_pts)
-        if area < 100:
+
+        # 2. Compute current edge lengths
+        # pts order: 0=TL, 1=TR, 2=BR, 3=BL
+        len_top = np.linalg.norm(pts[0] - pts[1])
+        len_right = np.linalg.norm(pts[1] - pts[2])
+        len_bottom = np.linalg.norm(pts[2] - pts[3])
+        len_left = np.linalg.norm(pts[3] - pts[0])
+        
+        # 3. Compute original edge lengths from Frame 0
+        orig_pts = self.ad_roi_0
+        orig_top = np.linalg.norm(orig_pts[0] - orig_pts[1]) # type: ignore
+        orig_right = np.linalg.norm(orig_pts[1] - orig_pts[2]) # type: ignore
+        orig_bottom = np.linalg.norm(orig_pts[2] - orig_pts[3]) # type: ignore
+        orig_left = np.linalg.norm(orig_pts[3] - orig_pts[0]) # type: ignore
+
+        # Avoid division by zero bugs
+        if any(v < 1.0 for v in [orig_top, orig_right, orig_bottom, orig_left, len_top, len_right, len_bottom, len_left]):
             return False
+
+        # 4. Calculate individual scaling factors per edge relative to baseline
+        scale_top = len_top / orig_top
+        scale_right = len_right / orig_right
+        scale_bottom = len_bottom / orig_bottom
+        scale_left = len_left / orig_left
+
+        # 5. RIGID GUARD: Edge Scale Variance Check
+        # In a real perspective warp, parallel edges scale relatively closely.
+        # If the top edge expands by 2x but the bottom shrinks to 0.5x, it's a skewed calculation.
+        scales = [scale_top, scale_right, scale_bottom, scale_left]
+        max_scale = max(scales)
+        min_scale = min(scales)
+        
+        # Rejects the frame if the distortion variance between any two edges exceeds a strict threshold
+        if (max_scale / min_scale) > 1.45:
+            return False
+
+        # 6. Absolute Size Boundaries
+        current_area = cv2.contourArea(render_pts)
+        base_area = cv2.contourArea(np.round(self.ad_roi_0).astype(np.int32)) # type: ignore
+        if current_area < (base_area * 0.3) or current_area > (base_area * 3.0):
+            return False
+
         return True
 
     def track_and_render_frame(self, img1: np.ndarray, frame_idx: int, log_file_handle, blend_mode: str = 'retinex') -> np.ndarray:
@@ -189,12 +230,13 @@ class PlanarARTracker:
         ad_roi_i = self.ad_roi_prev.copy() # type: ignore
         tracking_status = "LOST (Using Last Known)"
 
-        if des1 is not None and len(des1) >= 4:
+        if des1 is not None and len(self.des0) >= 4 and len(des1) >= 4: # type: ignore
             matches = self.flann.knnMatch(self.des0, des1, k=2) # type: ignore
             
             good_matches = []
             for m, n in matches:
-                if m.distance < 0.7 * n.distance:
+                # Restored to 0.70 to allow enough structural points for MAGSAC to process
+                if m.distance < 0.70 * n.distance:
                     if 0 <= m.queryIdx < len(self.kp0) and 0 <= m.trainIdx < len(kp1):
                         good_matches.append(m)
 
@@ -203,32 +245,34 @@ class PlanarARTracker:
                 dst_pts = np.array([kp1[m.trainIdx].pt for m in good_matches], dtype=np.float32).reshape(-1, 1, 2)
 
                 try:
-                    Hg, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                    # Upgrade to USAC_MAGSAC for significantly advanced noise filtering performance
+                    Hg, _ = cv2.findHomography(src_pts, dst_pts, cv2.USAC_MAGSAC, 3.0, maxIters=2000, confidence=0.99)
                     if Hg is not None:
                         candidate_roi = cv2.perspectiveTransform(self.ad_roi_0.reshape(-1, 1, 2), Hg).reshape(-1, 2) # type: ignore
+                        
+                        # Validate structural constraints directly against Frame 0 blueprints
                         if self.validate_polygon(candidate_roi):
                             ad_roi_i = candidate_roi
-                            self.ad_roi_prev = ad_roi_i
+                            self.ad_roi_prev = ad_roi_i  # Safe to update now
                             tracking_status = "TRACKING OK"
                         else:
-                            tracking_status = "FAILED VALIDATION (Bad Shape)"
+                            tracking_status = "FAILED VALIDATION (Skewed Geometry)"
                 except cv2.error:
                     tracking_status = "HOMOGRAPHY ERROR"
 
-        # Format and log string output stream data
+        # Format and log string coordinates data
         coords_list = np.round(ad_roi_i, 1).tolist()
         log_line = f"[{tracking_status}] Frame {frame_idx:04d} Coords -> TL: {coords_list[0]}, TR: {coords_list[1]}, BR: {coords_list[2]}, BL: {coords_list[3]}"
         
-        # Simultaneously print out to terminal and append to txt document container
         print(log_line)
         log_file_handle.write(log_line + "\n")
 
-        # Apply Retinex blending configurations and highlight borders
+        # Blend graphic overlays onto the background image
         img1 = self.blend_ad_into_roi(img1, ad_roi_i, mode=blend_mode)
         render_pts = np.round(ad_roi_i).astype(np.int32)
         cv2.polylines(img1, [render_pts], isClosed=True, color=(0, 0, 255), thickness=3)
         return img1
-
+    
     def start_pipeline(self, video_path: str, blend_mode: str = 'retinex', target_width: int = 1280):
         """Main execution tracking wrapper tracking frames over the video lifecycle loop stream."""
         cap = cv2.VideoCapture(video_path)
