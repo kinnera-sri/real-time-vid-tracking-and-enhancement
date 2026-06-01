@@ -555,9 +555,9 @@ class PlanarARTracker:
             return
 
         # Setup save targets directories
-        output_dir = "./real-time-vid-tracking-and-enhancement/tracked_frames_lego"
+        output_dir = "./real-time-vid-tracking-and-enhancement/tracked_frames_hybrid"
         os.makedirs(output_dir, exist_ok=True)
-        log_filepath = "./real-time-vid-tracking-and-enhancement/tracking_log_lego.txt"
+        log_filepath = "./real-time-vid-tracking-and-enhancement/tracking_log_hybrid.txt"
 
         cv2.namedWindow(self.win_live, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.win_live, 960, 540)
