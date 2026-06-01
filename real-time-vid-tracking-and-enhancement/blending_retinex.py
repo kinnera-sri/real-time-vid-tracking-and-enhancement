@@ -307,9 +307,9 @@ class RetinexBlender:
             return
 
         # Setup save targets directories
-        output_dir = "./retinex_tracked_frames"
+        output_dir = "./tracked_frames_retinex"
         os.makedirs(output_dir, exist_ok=True)
-        log_filepath = "./retinex_tracking_log.txt"
+        log_filepath = "./tracking_log_retinex.txt"
 
         cv2.namedWindow(self.win_live, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.win_live, 960, 540)
