@@ -28,7 +28,7 @@ class RetinexBlender:
         # Configure FLANN matcher
         FLANN_INDEX_KDTREE = 1
         IndexParamType = Dict[str, Union[bool, int, float, str]]
-        index_params: IndexParamType = {"algorithm": FLANN_INDEX_KDTREE, "trees": 5} # type: ignore
+        index_params: IndexParamType = {"algorithm": FLANN_INDEX_KDTREE, "trees": 9} # type: ignore
         search_params: IndexParamType = {"checks": 50} # type: ignore
         self.flann = cv2.FlannBasedMatcher(index_params, search_params)
         
@@ -83,7 +83,7 @@ class RetinexBlender:
         # Compute illumination at 3 different scales
         illum_15 = cv2.GaussianBlur(gray_frame, (15, 15), 0).astype(np.float32)
         illum_45 = cv2.GaussianBlur(gray_frame, (45, 45), 0).astype(np.float32)
-        illum_120 = cv2.GaussianBlur(gray_frame, (121, 121), 0).astype(np.float32)  # Must be odd
+        illum_120 = cv2.GaussianBlur(gray_frame, (95, 95), 0).astype(np.float32)  # Must be odd
         
         # Average the three scales for balanced micro and macro lighting
         illumination = (illum_15 + illum_45 + illum_120) / 3.0
