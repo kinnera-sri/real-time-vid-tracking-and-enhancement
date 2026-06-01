@@ -137,9 +137,12 @@ class RetinexHarmonizationBlender:
         # --- SATURATION PROTECTION ---
         # Chroma = sqrt(a^2 + b^2) in LAB space (channels 1 and 2)
         chroma = np.sqrt(region[:, 1] ** 2 + region[:, 2] ** 2)
+
         # Normalize to [0, 1] — pixels with chroma > ~30 are visibly saturated
-        sat_weight = np.clip(chroma / 40.0, 0, 1)  # 1 = fully saturated, 0 = gray
+        sat_weight = np.clip(chroma / 30.0, 0, 1)  # 1 = fully saturated, 0 = gray
+
         # Reduce harmonization strength proportionally to saturation
+
         # Saturated pixels (logo red) get near-zero harmonization
         effective_strength = strength * (1.0 - sat_weight)  # shape: (N,)
         effective_strength = effective_strength[:, np.newaxis]  # broadcast over channels
