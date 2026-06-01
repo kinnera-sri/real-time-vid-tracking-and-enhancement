@@ -62,6 +62,10 @@ class PlanarARTracker:
         self.win_roi = "1. Select Target ROI"
         self.win_plane = "2. Select Surface Plane"
         self.win_live = "Live Planar Tracking (Press 'q' to Quit)"
+        
+        # Temporal smoothing for Retinex illumination (rolling average over 8 frames)
+        self.illum_history: list = []
+        self.illum_history_max_len = 8
 
     def _create_warped_ad_and_mask(self, frame_shape: Tuple[int, ...], dst_pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Calculates perspective homography mapping and warps the graphic asset and its alpha mask."""
@@ -87,133 +91,216 @@ class PlanarARTracker:
         warped_mask = cv2.warpPerspective(alpha, H, (fw, fh))
         return warped_ad, warped_mask
 
-    def _apply_retinex_lighting(self, warped_ad: np.ndarray, frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Extracts ambient lighting map from background frame (Retinex) and casts it onto the asset."""
-        # Convert background frame to grayscale to calculate illumination intensity
+    def _apply_multiscale_retinex(self, warped_ad: np.ndarray, frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Multi-scale Retinex: blends 3 illumination scales (15, 45, 120) for accurate lighting capture."""
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
         
-        # Large Gaussian kernel acts as a low-pass filter estimating the ambient illumination map (L)
-        illumination = cv2.GaussianBlur(gray_frame, (45, 45), 0)
+        # Compute illumination at 3 different scales
+        illum_15 = cv2.GaussianBlur(gray_frame, (15, 15), 0).astype(np.float32)
+        illum_45 = cv2.GaussianBlur(gray_frame, (45, 45), 0).astype(np.float32)
+        illum_120 = cv2.GaussianBlur(gray_frame, (121, 121), 0).astype(np.float32)  # Must be odd
         
-        # Safeguard against dividing by zero if the mask region is completely empty
+        # Average the three scales for balanced micro and macro lighting
+        illumination = (illum_15 + illum_45 + illum_120) / 3.0
+        
+        # Safeguard against dividing by zero
         mask_pixels = illumination[mask > 0]
         avg_local_illum = np.mean(mask_pixels) if mask_pixels.size > 0 else 128.0
-        if avg_local_illum < 1.0: 
+        if avg_local_illum < 1.0:
             avg_local_illum = 1.0
-            
-        # Create a localized lighting modifier map
-        illum_multiplier = illumination / avg_local_illum
         
-        # Multiply the lighting variation map across the target asset channels
+        # Temporal smoothing: rolling average to prevent flicker
+        self.illum_history.append(avg_local_illum)
+        if len(self.illum_history) > self.illum_history_max_len:
+            self.illum_history.pop(0)
+        smoothed_illum = np.mean(self.illum_history)
+        
+        # Create lighting modifier map
+        illum_multiplier = illumination / smoothed_illum
+        
+        # Apply illumination to asset
         ad_retinex = warped_ad.astype(np.float32)
         for c in range(3):
             ad_retinex[:, :, c] *= illum_multiplier
             
         return np.clip(ad_retinex, 0, 255).astype(np.uint8)
     
-    def _apply_lab_harmonization(
-        self,
-        blended_img,
-        frame,
-        mask,
-        strength=0.6
-    ):
-
-        # --------------------------------------------------------
-        # CONVERT TO LAB
-        # --------------------------------------------------------
-
-        blend_lab = cv2.cvtColor(
-            blended_img,
-            cv2.COLOR_BGR2LAB
-        ).astype(np.float32)
-
-        frame_lab = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2LAB
-        ).astype(np.float32)
+    def _detect_shadow_regions(self, frame: np.ndarray, threshold_lum: float = 100.0, threshold_sat: float = 30.0) -> np.ndarray:
+        """Detects shadow regions using luminance and saturation thresholds."""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
+        
+        # V channel = brightness/luminance
+        v = hsv[:, :, 2]
+        
+        # S channel = saturation
+        s = hsv[:, :, 1]
+        
+        # Shadows: low brightness AND low saturation (or vice versa)
+        shadow_mask = ((v < threshold_lum) | (s < threshold_sat)).astype(np.uint8) * 255
+        
+        # Morphological smoothing to reduce noise
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        shadow_mask = cv2.morphologyEx(shadow_mask, cv2.MORPH_CLOSE, kernel)
+        
+        return shadow_mask
+    
+    def _apply_retinex_lighting(self, warped_ad, frame, mask):
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        
+        # Multi-scale for accuracy
+        scales = [15, 45, 120]
+        illum_maps = [cv2.GaussianBlur(gray_frame, (s if s%2==1 else s+1, s if s%2==1 else s+1), 0) for s in scales]
+        illumination = np.mean(illum_maps, axis=0)
+    
+        mask_pixels = illumination[mask > 0]
+        avg_local_illum = float(np.mean(mask_pixels)) if mask_pixels.size > 0 else 128.0
+        avg_local_illum = max(avg_local_illum, 1.0)
+    
+        illum_multiplier = illumination / avg_local_illum
+    
+        # --- CLAMP THE MULTIPLIER ---
+        # Don't let it brighten or darken the ad more than ±25%
+        illum_multiplier = np.clip(illum_multiplier, 0.75, 1.25)
+    
+        ad_retinex = warped_ad.astype(np.float32)
+        for c in range(3):
+            ad_retinex[:, :, c] *= illum_multiplier
+    
+        return np.clip(ad_retinex, 0, 255).astype(np.uint8)
+    
+    def _apply_shadow_aware_blending(self, warped_ad: np.ndarray, frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Apply stronger darkening in shadow regions while preserving bright areas."""
+        shadow_mask = self._detect_shadow_regions(frame)
+        shadow_regions = (shadow_mask > 0) & (mask > 0)
+        
+        ad_shadow_aware = warped_ad.astype(np.float32)
+        
+        # Darken more aggressively in shadows (scale multiplier)
+        if np.count_nonzero(shadow_regions) > 0:
+            ad_shadow_aware[shadow_regions] *= 0.75  # Reduce to 75% brightness in shadows
+        
+        return np.clip(ad_shadow_aware, 0, 255).astype(np.uint8)
+    
+    def _guided_filter_feather(self, mask: np.ndarray, guide: np.ndarray, radius: int = 15, eps: float = 0.01) -> np.ndarray:
+        """Edge-aware feathering using guided filter (uses background frame as guide)."""
+        # Convert guide to grayscale if not already
+        if len(guide.shape) == 3:
+            guide = cv2.cvtColor(guide, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        else:
+            guide = guide.astype(np.float32) / 255.0
+        
+        mask_float = mask.astype(np.float32) / 255.0
+        
+        # Simplified guided filter using edge-aware smoothing
+        # Step 1: Create a coarse approximation using bilateral filter on the guide
+        guide_edges = cv2.bilateralFilter((guide * 255).astype(np.uint8), 9, 15, 15).astype(np.float32) / 255.0 
+        
+        # Step 2: Compute mean of mask and guide in local windows
+        mean_mask = cv2.boxFilter(mask_float, -1, (radius, radius))
+        mean_guide = cv2.boxFilter(guide_edges, -1, (radius, radius))
+        
+        mean_mask_guide = cv2.boxFilter(mask_float * guide_edges, -1, (radius, radius))
+        var_guide = cv2.boxFilter(guide_edges * guide_edges, -1, (radius, radius)) - mean_guide * mean_guide
+        
+        # Step 3: Compute linear coefficients
+        cov_mask_guide = mean_mask_guide - mean_mask * mean_guide
+        a = cov_mask_guide / (var_guide + eps)
+        b = mean_mask - a * mean_guide
+        
+        # Step 4: Apply to get filtered mask
+        mean_a = cv2.boxFilter(a, -1, (radius, radius))
+        mean_b = cv2.boxFilter(b, -1, (radius, radius))
+        
+        filtered = mean_a * guide_edges + mean_b
+        filtered = np.clip(filtered, 0, 1) * 255
+        
+        return filtered.astype(np.uint8)
+    
+    def _detect_and_transfer_specular_highlights(self, blended: np.ndarray, frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Detect bright spots on background plane and composite them on top using screen blending."""
+        # Convert to grayscale for highlight detection
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        
+        # Detect bright regions (specular highlights): very high luminance
+        highlight_threshold = np.percentile(gray_frame[mask > 0], 85) if np.count_nonzero(mask) > 0 else 0.8
+        highlight_mask = (gray_frame > highlight_threshold).astype(np.uint8) * 255
+        highlight_mask = cv2.bitwise_and(highlight_mask, highlight_mask, mask=mask)
+        
+        # Dilate highlights slightly for visibility
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        highlight_mask = cv2.dilate(highlight_mask, kernel, iterations=1)
+        
+        # Extract highlight regions from original frame
+        highlight_regions = frame.copy()
+        
+        # Apply screen blending for highlights: result = 1 - (1-A) * (1-B)
+        result = blended.astype(np.float32) / 255.0
+        highlights = highlight_regions.astype(np.float32) / 255.0
+        highlight_alpha = highlight_mask.astype(np.float32) / 255.0
+        
+        for c in range(3):
+            # Screen blend: additive blending that brightens
+            screen_blended = 1.0 - (1.0 - result[:, :, c]) * (1.0 - highlights[:, :, c])
+            result[:, :, c] = (
+                highlight_alpha * screen_blended +
+                (1.0 - highlight_alpha) * result[:, :, c]
+            )
+        
+        return np.clip(result * 255, 0, 255).astype(np.uint8)
+    
+    def _apply_lab_harmonization(self, blended_img, frame, mask, strength=0.3):
+        blend_lab = cv2.cvtColor(blended_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+        frame_lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
 
         mask_region = mask > 0
-
         if np.count_nonzero(mask_region) == 0:
             return blended_img
 
-        # --------------------------------------------------------
-        # REGION STATS
-        # --------------------------------------------------------
-
         blend_pixels = blend_lab[mask_region]
-
         frame_pixels = frame_lab[mask_region]
 
-        blend_mean = np.mean(
-            blend_pixels,
-            axis=0
-        )
-
-        blend_std = np.std(
-            blend_pixels,
-            axis=0
-        )
-
-        frame_mean = np.mean(
-            frame_pixels,
-            axis=0
-        )
-
-        frame_std = np.std(
-            frame_pixels,
-            axis=0
-        )
-
-        # --------------------------------------------------------
-        # MATCH DISTRIBUTION
-        # --------------------------------------------------------
+        blend_mean = np.mean(blend_pixels, axis=0)
+        blend_std  = np.std(blend_pixels, axis=0)
+        frame_mean = np.mean(frame_pixels, axis=0)
+        frame_std  = np.std(frame_pixels, axis=0)
 
         adjusted = blend_lab.copy()
-
         region = adjusted[mask_region]
 
-        region = (
+        # Standard distribution match
+        matched = (region - blend_mean) * (frame_std / (blend_std + 1e-6)) + frame_mean
 
-            (region - blend_mean)
+        # --- SATURATION PROTECTION ---
+        # Chroma = sqrt(a^2 + b^2) in LAB space (channels 1 and 2)
+        chroma = np.sqrt(region[:, 1] ** 2 + region[:, 2] ** 2)
+        # Normalize to [0, 1] — pixels with chroma > ~30 are visibly saturated
+        sat_weight = np.clip(chroma / 40.0, 0, 1)  # 1 = fully saturated, 0 = gray
+        # Reduce harmonization strength proportionally to saturation
+        # Saturated pixels (logo red) get near-zero harmonization
+        effective_strength = strength * (1.0 - sat_weight)  # shape: (N,)
+        effective_strength = effective_strength[:, np.newaxis]  # broadcast over channels
 
-            *
+        # Only harmonize L channel at full strength (lighting), protect a* b* (color)
+        blended = np.zeros_like(region)
+        blended[:, 0] = strength * matched[:, 0] + (1.0 - strength) * region[:, 0]       # L: always adjust
+        blended[:, 1] = effective_strength[:, 0] * matched[:, 1] + (1.0 - effective_strength[:, 0]) * region[:, 1]  # a*: protected
+        blended[:, 2] = effective_strength[:, 0] * matched[:, 2] + (1.0 - effective_strength[:, 0]) * region[:, 2]  # b*: protected
 
-            (frame_std / (blend_std + 1e-6))
+        adjusted[mask_region] = blended
+        adjusted = np.clip(adjusted, 0, 255).astype(np.uint8)
+        
+        return cv2.cvtColor(adjusted, cv2.COLOR_LAB2BGR)
 
-            +
-
-            frame_mean
-        )
-
-        # partial harmonization
-        region = (
-
-            strength * region
-
-            +
-
-            (1.0 - strength)
-
-            * blend_lab[mask_region]
-        )
-
-        adjusted[mask_region] = region
-
-        adjusted = np.clip(
-            adjusted,
-            0,
-            255
-        ).astype(np.uint8)
-
-        return cv2.cvtColor(
-            adjusted,
-            cv2.COLOR_LAB2BGR
-        )
-
-    def blend_ad_into_roi(self, frame: np.ndarray, dst_pts: np.ndarray, mode: str = 'retinex', feather_radius: int = 5) -> np.ndarray:
-        """Blends the warped asset onto the video frame backdrop using feathered alpha or Retinex mapping."""
+    def blend_ad_into_roi(self, frame: np.ndarray, dst_pts: np.ndarray, mode: str = 'retinex', feather_radius: int = 15) -> np.ndarray:
+        """
+        Advanced blending pipeline:
+        1. Multi-scale Retinex for accurate lighting
+        2. Shadow-aware darkening
+        3. Edge-aware guided filter feathering
+        4. Linear RGB compositing with proper gamma
+        5. Selective LAB chrominance harmonization
+        6. Specular highlight transfer
+        """
         warped_ad, warped_mask = self._create_warped_ad_and_mask(frame.shape, dst_pts)
         if np.count_nonzero(warped_mask) == 0:
             return frame
@@ -222,10 +309,11 @@ class PlanarARTracker:
         mask_for_clone = cv2.threshold(warped_mask, 1, 255, cv2.THRESH_BINARY)[1].astype(np.uint8)
         center = tuple(np.mean(dst_pts, axis=0).astype(int))
 
-        # Apply Retinex illumination matching to the asset before standard compositing
+        # Apply advanced Retinex illumination matching
         if mode == 'retinex':
-            warped_ad = self._apply_retinex_lighting(warped_ad, frame, mask_for_clone)
-            mode = 'feather' # Hand over execution down to the feather processing stage
+            warped_ad = self._apply_multiscale_retinex(warped_ad, frame, mask_for_clone)
+            warped_ad = self._apply_shadow_aware_blending(warped_ad, frame, mask_for_clone)
+            mode = 'feather'  # Hand over to feather processing stage
 
         if mode in ('seamless', 'seamless_feather'):
             try:
@@ -234,17 +322,14 @@ class PlanarARTracker:
                 blended_base = frame.copy()
 
         if mode in ('feather', 'seamless_feather'):
-            if feather_radius % 2 == 0:
-                feather_radius += 1
-                
             # ============================================================
-            # FEATHER MASK
+            # EDGE-AWARE FEATHERING (Guided Filter)
             # ============================================================
-
-            soft_mask = cv2.GaussianBlur(
+            
+            soft_mask = self._guided_filter_feather(
                 warped_mask,
-                (feather_radius, feather_radius),
-                0
+                frame,
+                radius=feather_radius
             )
 
             alpha = soft_mask.astype(np.float32) / 255.0
@@ -254,7 +339,6 @@ class PlanarARTracker:
                 alpha,
                 alpha
             ])
-
 
             # ============================================================
             # SELECT SOURCE
@@ -266,45 +350,47 @@ class PlanarARTracker:
                 else blended_base
             )
 
-
             # ============================================================
             # CONVERT TO LINEAR RGB
             # ============================================================
 
             src_linear = srgb_to_linear(src_img)
-
             dst_linear = srgb_to_linear(frame)
-
 
             # ============================================================
             # LINEAR RGB BLENDING
             # ============================================================
 
             composite_linear = (
-            
                 alpha_3c * src_linear +
-
                 (1.0 - alpha_3c) * dst_linear
             )
-
 
             # ============================================================
             # CONVERT BACK TO SRGB
             # ============================================================
 
-            composite_srgb = linear_to_srgb(
-                composite_linear
-            )
+            composite_srgb = linear_to_srgb(composite_linear)
 
             # ============================================================
-            # LAB HARMONIZATION
+            # SELECTIVE LAB HARMONIZATION (Chrominance only)
             # ============================================================
 
-            final_result = self._apply_lab_harmonization(
+            harmonized = self._apply_lab_harmonization(
                 composite_srgb,
                 frame,
                 mask_for_clone,
-                strength=0.5
+                strength=0.3
+            )
+
+            # ============================================================
+            # SPECULAR HIGHLIGHT TRANSFER
+            # ============================================================
+
+            final_result = self._detect_and_transfer_specular_highlights(
+                harmonized,
+                frame,
+                mask_for_clone
             )
 
             return final_result
@@ -451,8 +537,8 @@ class PlanarARTracker:
 
         # Blend graphic overlays onto the background image
         img1 = self.blend_ad_into_roi(img1, ad_roi_i, mode=blend_mode)
-        render_pts = np.round(ad_roi_i).astype(np.int32)
-        cv2.polylines(img1, [render_pts], isClosed=True, color=(0, 0, 255), thickness=3)
+        # render_pts = np.round(ad_roi_i).astype(np.int32)
+        # cv2.polylines(img1, [render_pts], isClosed=True, color=(0, 0, 255), thickness=3)
         return img1
     
     def start_pipeline(self, video_path: str, blend_mode: str = 'retinex', target_width: int = 1280):
