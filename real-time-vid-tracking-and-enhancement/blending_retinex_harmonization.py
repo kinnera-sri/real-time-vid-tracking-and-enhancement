@@ -109,25 +109,7 @@ class RetinexHarmonizationBlender:
             ad_retinex[:, :, c] *= illum_multiplier
             
         return np.clip(ad_retinex, 0, 255).astype(np.uint8)
-    
-    def _apply_shadow_aware_blending(self, warped_ad: np.ndarray, frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Apply stronger darkening in shadow regions while preserving bright areas."""
-        # Convert to grayscale for shadow detection
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        
-        # Detect dark regions (shadows)
-        threshold_lum = 100.0
-        shadow_mask = (gray_frame < threshold_lum).astype(np.uint8) * 255
-        shadow_mask = cv2.bitwise_and(shadow_mask, shadow_mask, mask=mask)
-        
-        ad_shadow_aware = warped_ad.astype(np.float32)
-        
-        # Darken more aggressively in shadows
-        shadow_regions = (shadow_mask > 0) & (mask > 0)
-        if np.count_nonzero(shadow_regions) > 0:
-            ad_shadow_aware[shadow_regions] *= 0.75  # Reduce to 75% brightness in shadows
-        
-        return np.clip(ad_shadow_aware, 0, 255).astype(np.uint8)
+
 
     def _apply_lab_harmonization(self, blended_img, frame, mask, strength=0.3):
         """Apply LAB color harmonization with saturation protection for vibrant elements."""
@@ -173,12 +155,12 @@ class RetinexHarmonizationBlender:
         
         return cv2.cvtColor(adjusted, cv2.COLOR_LAB2BGR)
 
-    def blend_ad_into_roi(self, frame: np.ndarray, dst_pts: np.ndarray) -> np.ndarray:
+    def blend_ad_into_roi(self, frame: np.ndarray, dst_pts: np.ndarray, feather_radius: int = 21) -> np.ndarray:
         """
         Combined Retinex + Harmonization blending pipeline:
         1. Multi-scale Retinex for accurate lighting
-        2. Shadow-aware darkening
-        3. Alpha blending
+        2. Feathered edge smoothing for seamless blending
+        3. Alpha blending with soft mask
         4. LAB harmonization for color matching
         """
         warped_ad, warped_mask = self._create_warped_ad_and_mask(frame.shape, dst_pts)
@@ -189,10 +171,14 @@ class RetinexHarmonizationBlender:
 
         # Apply Retinex illumination matching
         warped_ad = self._apply_multiscale_retinex(warped_ad, frame, mask_for_clone)
-        warped_ad = self._apply_shadow_aware_blending(warped_ad, frame, mask_for_clone)
 
-        # Simple alpha blending
-        alpha = warped_mask.astype(np.float32) / 255.0
+        # Create feathered soft edges by blurring the mask
+        if feather_radius % 2 == 0:
+            feather_radius += 1
+        soft_mask = cv2.GaussianBlur(warped_mask, (feather_radius, feather_radius), 0)
+        
+        # Alpha blending with soft feathered edges
+        alpha = soft_mask.astype(np.float32) / 255.0
         alpha_3c = cv2.merge([alpha, alpha, alpha])
         
         blended = (
@@ -356,9 +342,9 @@ class RetinexHarmonizationBlender:
             return
 
         # Setup save targets directories
-        output_dir = "./retinex_harmonization_tracked_frames"
+        output_dir = "./real-time-vid-tracking-and-enhancement/tracked_frames_retinex_harmonization"
         os.makedirs(output_dir, exist_ok=True)
-        log_filepath = "./retinex_harmonization_tracking_log.txt"
+        log_filepath = "./real-time-vid-tracking-and-enhancement/tracking_log_retinex_harmonization.txt"
 
         cv2.namedWindow(self.win_live, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.win_live, 960, 540)
